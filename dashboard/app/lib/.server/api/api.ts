@@ -14,6 +14,11 @@ import type { Database } from "~/lib/.server/database.types";
 import { customerHasActiveSubscriptions } from "../customer-has-active-subscriptions.request";
 import { stripe } from "../stripe";
 import { getSubscriptionPlanInfo } from "../get-subscription-plan-info";
+import {
+  SELF_HOSTED,
+  createSelfHostedApiKey,
+  verifySelfHostedApiKey,
+} from "../self-hosted-api-keys";
 
 interface DashboardKeyContext {
   apiKey: string | null;
@@ -30,20 +35,65 @@ async function getTemporaryApiKey(
   projectId: string,
   cookieHeader: string,
   supabase: SupabaseClient<Database>,
+  supabaseServiceRole: SupabaseClient<Database>,
 ): Promise<DashboardApiKeyResponse> {
   const cookieName = `${TMP_API_KEY_COOKIE_PREFIX}_${projectId}`;
   const apiKeyCookie = createCookie(cookieName);
-
   const apiKeySession = (await apiKeyCookie.parse(cookieHeader)) || {};
 
-  if (apiKeySession && apiKeySession.apiKey) {
-    return { apiKey: apiKeySession.apiKey };
+  if (apiKeySession?.apiKey) {
+    if (!SELF_HOSTED) {
+      return { apiKey: apiKeySession.apiKey };
+    }
+
+    const existingKey = await verifySelfHostedApiKey({
+      supabaseServiceRole,
+      apiKey: apiKeySession.apiKey,
+      projectId,
+    });
+
+    if (existingKey) {
+      return { apiKey: apiKeySession.apiKey };
+    }
   }
 
   const currentUser = await supabase.auth.getUser();
 
   if (!currentUser.data?.user) {
     throw new Error("User not found");
+  }
+
+  if (SELF_HOSTED) {
+    const project = await supabaseServiceRole
+      .from("projects")
+      .select("id, team_id")
+      .eq("id", projectId)
+      .eq("team_id", teamId)
+      .maybeSingle();
+
+    if (project.error || !project.data) {
+      return { apiKey: null, error: "project not found" };
+    }
+
+    const localKey = await createSelfHostedApiKey({
+      supabaseServiceRole,
+      projectId,
+      teamId,
+      createdBy: currentUser.data.user.id,
+      temporary: true,
+    });
+
+    const newSession = createCookie(cookieName, {
+      maxAge: 60 * 60 * 23,
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+    });
+
+    return {
+      apiKey: localKey.key,
+      cookie: newSession,
+    };
   }
 
   const team = await supabase
@@ -64,7 +114,6 @@ async function getTemporaryApiKey(
     return { apiKey: null, error: "no active subscription" };
   }
 
-  // Get plan info to add to metadata
   const planMetadata: Record<string, string> = {};
   if (team.data.stripe_customer_id) {
     try {
@@ -76,12 +125,8 @@ async function getTemporaryApiKey(
 
       if (subscriptions.data.length > 0) {
         const planInfo = getSubscriptionPlanInfo(subscriptions.data[0]);
-        if (planInfo.productId) {
-          planMetadata.plan_product_id = planInfo.productId;
-        }
-        if (planInfo.planName) {
-          planMetadata.plan_name = planInfo.planName;
-        }
+        if (planInfo.productId) planMetadata.plan_product_id = planInfo.productId;
+        if (planInfo.planName) planMetadata.plan_name = planInfo.planName;
         if (planInfo.postLimit) {
           planMetadata.plan_post_limit = planInfo.postLimit.toString();
         }
@@ -96,7 +141,6 @@ async function getTemporaryApiKey(
         "Error fetching plan info for temporary API key metadata:",
         error,
       );
-      // Continue without plan metadata
     }
   }
 
@@ -125,7 +169,7 @@ async function getTemporaryApiKey(
   }
 
   const newSession = createCookie(cookieName, {
-    maxAge: 60 * 60 * 23, // 1 day in seconds
+    maxAge: 60 * 60 * 23,
     httpOnly: true,
   });
 
@@ -133,20 +177,7 @@ async function getTemporaryApiKey(
     apiKey: key,
     cookie: newSession,
   };
-} /**
- * Creates a `loader` or `action` function that automatically injects a temporary API key.
- *
- * @example Inline definition of a loader function
- * const loader = withDashboardKey(async function({ apiKey }) {
- *     return {};
- * });
- *
- * @example Using a named action function
- * function myAction({ apiKey }) { ... }
- *
- * export const action = withDashboardKey(myAction);
- *
- */
+}
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export function withDashboardKey<
@@ -163,23 +194,18 @@ export function withDashboardKey<
   return async function (
     args: (LoaderFunctionArgs | ActionFunctionArgs) & SupabaseContext,
   ) {
-    const { params, supabase } = args;
-
+    const { params, supabase, supabaseServiceRole } = args;
     const { teamId, projectId } = params;
 
-    if (!teamId) {
-      throw new Error("Team code is required");
-    }
-
-    if (!projectId) {
-      throw new Error("Project ID is required");
-    }
+    if (!teamId) throw new Error("Team code is required");
+    if (!projectId) throw new Error("Project ID is required");
 
     const apiKeyResult = await getTemporaryApiKey(
       teamId,
       projectId,
       args.request.headers.get("cookie") || "",
       supabase,
+      supabaseServiceRole,
     );
 
     const res = await handler({ ...args, apiKey: apiKeyResult.apiKey });
@@ -197,9 +223,7 @@ export function withDashboardKey<
 
       if (dataResponse?.type == "DataWithResponseInit") {
         return data(dataResponse.data, {
-          headers: {
-            "Set-Cookie": serialized,
-          },
+          headers: { "Set-Cookie": serialized },
         });
       } else if (res instanceof Response) {
         res.headers.append("Set-Cookie", serialized);
