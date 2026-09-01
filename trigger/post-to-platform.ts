@@ -22,7 +22,11 @@ import { differenceInDays } from "date-fns";
 import Stripe from "stripe";
 import { Database } from "./supabase.types";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+const SELF_HOSTED = process.env.SELF_HOSTED === "true";
+const stripe =
+  !SELF_HOSTED && process.env.STRIPE_SECRET_KEY
+    ? new Stripe(process.env.STRIPE_SECRET_KEY)
+    : null;
 const STRIPE_METER_EVENT = process.env.STRIPE_METER_EVENT || "successful_post";
 
 const supabaseClient = createClient<Database>(
@@ -113,23 +117,20 @@ const handleTokenRefresh = async ({
 
     if (error) {
       console.error(error);
-
-      return {
-        success: false,
-        error: error.message,
-      };
+      return { success: false, error: error.message };
     }
   } catch (refreshError) {
     console.error(refreshError);
     return {
       success: false,
-      error: refreshError.message,
+      error:
+        refreshError instanceof Error
+          ? refreshError.message
+          : "Failed to refresh token",
     };
   }
 
-  return {
-    success: true,
-  };
+  return { success: true };
 };
 
 export const postToPlatform = task({
@@ -155,15 +156,21 @@ export const postToPlatform = task({
       appCredentials,
       projectId,
     } = payload;
+
     let postResult: PostResult | null = null;
+
     try {
       await tags.add(`${account.id}`);
 
-      logger.info("Starting post processing", { ...payload });
+      logger.info("Starting post processing", {
+        postId,
+        platform,
+        accountId: account.id,
+        selfHosted: SELF_HOSTED,
+      });
 
-      logger.info("Creating Post Client");
       const postClient = createPostClient({
-        supabaseClient: supabaseClient,
+        supabaseClient,
         platformName: platform,
         appCredentials,
       });
@@ -175,27 +182,18 @@ export const postToPlatform = task({
           new Date(),
         ) <= 7
       ) {
-        logger.info("Refreshing Token", {
-          platform: account.provider,
-          account,
-        });
         const refreshed = await handleTokenRefresh({
           postClient,
           account: account as SocialAccount,
         });
 
         if (!refreshed.success) {
-          logger.error("Failed to refresh token", {
-            account,
-            error: refreshed.error,
-          });
           postResult = {
             provider_connection_id: account.id,
             post_id: postId,
             success: false,
             error_message: refreshed.error,
           };
-
           throw new Error("Invalid Token");
         }
       }
@@ -208,28 +206,21 @@ export const postToPlatform = task({
         platformConfig,
       });
 
-      if (postResult.success) {
+      if (postResult.success && stripe) {
         try {
-          logger.info("Increasing stripe meter", {
-            meter: STRIPE_METER_EVENT,
-            stripe_customer_id: stripeCustomerId,
-          });
-          const meterEvent = await stripe.billing.meterEvents.create({
+          await stripe.billing.meterEvents.create({
             event_name: STRIPE_METER_EVENT,
             payload: {
               stripe_customer_id: stripeCustomerId,
             },
           });
-
-          logger.info("Created meter event", { meterEvent });
         } catch (error) {
-          logger.error("Failed to increase stripe meter", {
+          logger.error("Failed to increase Stripe meter", {
             meter: STRIPE_METER_EVENT,
             stripe_customer_id: stripeCustomerId,
             error,
           });
         }
-
       }
     } catch (error) {
       logger.error("Failed Processing Platform Post", { error });
@@ -239,16 +230,15 @@ export const postToPlatform = task({
           provider_connection_id: account.id,
           success: false,
           error_message:
-            "Unexcpted Error: Post Status Unavailable, Please check the social account.",
+            "Unexpected Error: Post Status Unavailable, please check the social account.",
           post_id: postId,
-          details: { error: error },
+          details: { error },
         };
       }
     }
 
     await tags.add(`result_${postResult.success ? "success" : "error"}`);
 
-    logger.info("Saving Post Result", { postResult });
     const { data: insertedPostResult, error: insertResultError } =
       await supabaseClient
         .from("social_post_results")
@@ -259,7 +249,7 @@ export const postToPlatform = task({
     if (insertResultError) {
       logger.error("Failed to insert post result", { insertResultError });
     } else {
-      if (insertedPostResult.success) {
+      if (insertedPostResult.success && !SELF_HOSTED) {
         void idempotencyKeys
           .create(["increment-team-usage", insertedPostResult.id], {
             scope: "global",
@@ -279,7 +269,6 @@ export const postToPlatform = task({
           )
           .catch((error) => {
             logger.error("Failed to trigger increment team usage", {
-              stripe_customer_id: stripeCustomerId,
               team_id: teamId,
               social_post_result_id: insertedPostResult.id,
               error,
@@ -288,7 +277,7 @@ export const postToPlatform = task({
       }
 
       await tasks.trigger("process-webhooks", {
-        projectId: projectId,
+        projectId,
         eventType: "social.post.result.created",
         eventData: {
           details: insertedPostResult.details,
@@ -307,9 +296,9 @@ export const postToPlatform = task({
       const { error: postResultMediaError } = await supabaseClient
         .from("social_post_result_post_media")
         .insert(
-          media.map((m) => ({
+          media.map((medium) => ({
             social_post_result_id: insertedPostResult.id,
-            social_post_media_id: m.id,
+            social_post_media_id: medium.id,
           })),
         );
 
