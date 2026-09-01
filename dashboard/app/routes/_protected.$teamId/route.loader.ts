@@ -4,6 +4,7 @@ import { withSupabase } from "~/lib/.server/supabase";
 import { customerHasActiveSubscriptions } from "~/lib/.server/customer-has-active-subscriptions.request";
 import { customerHasSubscriptionSystemCredsAddon } from "~/lib/.server/customer-has-subscription-system-creds-addon.request";
 import { customerHasLegacyPlan } from "~/lib/.server/customer-has-legacy-plan.request";
+import { SELF_HOSTED } from "~/lib/.server/self-hosted-api-keys";
 
 export const loader = withSupabase(async ({ supabase, params }) => {
   const { teamId } = params;
@@ -31,6 +32,20 @@ export const loader = withSupabase(async ({ supabase, params }) => {
 
   if (!team) {
     return new Response("Team not found", { status: 404 });
+  }
+
+  if (SELF_HOSTED) {
+    return data({
+      team,
+      teams: allTeams,
+      projects: projects.data || [],
+      user: currentUser.data.user,
+      billing: {
+        active: true,
+        creds_addon: true,
+        legacy: false,
+      },
+    });
   }
 
   const [hasActiveSubscription, hasSystemCredsAddon, hasLegacyPlan] =
