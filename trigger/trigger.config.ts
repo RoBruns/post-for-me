@@ -14,7 +14,7 @@ const runtimeEnvNames = [
 ] as const;
 
 export default defineConfig({
-  project: process.env.TRIGGER_PROJECT_ID!,
+  project: "proj_shhvvnfshigtpypjhnii",
   build: {
     extensions: [
       ffmpeg(),
