@@ -5,16 +5,16 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import type { Request } from 'express';
+import { createHash } from 'crypto';
 
 import { SupabaseService } from '../supabase/supabase.service';
 import { getMetaString, getUnkeyPrincipalFromRequest } from './unkey-principal';
 import type { RequestUser } from './user.interface';
 
-// Augment Express Request type (good practice)
 declare module 'express' {
   interface Request {
-    user?: RequestUser; // User object attached by the guard
-    planType?: string; // Plan type from Unkey metadata
+    user?: RequestUser;
+    planType?: string;
   }
 }
 
@@ -31,45 +31,30 @@ type TokenValidationResult = {
 export class AuthGuard implements CanActivate {
   constructor(private supabaseService: SupabaseService) {}
 
-  canActivate(context: ExecutionContext): boolean {
-    // Get the request object early
-    const httpContext = context.switchToHttp();
-    const request = httpContext.getRequest<Request>();
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest<Request>();
     if (!request) {
-      // Should typically not happen in HTTP context, but good to check
       throw new UnauthorizedException('Request object not available.');
     }
 
     return this.validateRequest(request);
   }
 
-  private validateRequest(request: Request): boolean {
+  private async validateRequest(request: Request): Promise<boolean> {
     try {
-      const validationResult = this.getAuthenticationFromPrincipal(request);
+      const validationResult =
+        process.env.SELF_HOSTED === 'true'
+          ? await this.getAuthenticationFromSelfHostedKey(request)
+          : this.getAuthenticationFromPrincipal(request);
 
       if (!validationResult.isAuthenticated) {
-        throw new UnauthorizedException('Invalid or missing Unkey principal');
+        throw new UnauthorizedException('Invalid or missing API key');
       }
 
-      // --- Validation successful ---
       const { userId, projectId, keyId, teamId, planType } = validationResult;
 
-      // Check if this is a request to social-account-feeds endpoint
-      const isSocialAccountFeedsEndpoint = request.path.includes(
-        '/social-account-feeds',
-      );
-
-      // If accessing social-account-feeds, plan_type must be "new_pricing"
-      if (isSocialAccountFeedsEndpoint && planType !== 'new_pricing') {
-        throw new UnauthorizedException(
-          'Access to social account feeds requires new_pricing plan.',
-        );
-      }
-
-      // Set the userId in the SupabaseService for subsequent use *within this request scope*
       this.supabaseService.setUser(userId!);
 
-      // Attach the guaranteed user object to the request
       request.user = {
         id: userId!,
         projectId: projectId!,
@@ -78,14 +63,58 @@ export class AuthGuard implements CanActivate {
       };
       request.planType = planType;
 
-      return true; // Access granted
+      return true;
     } catch (error: unknown) {
       if (error instanceof UnauthorizedException) {
         throw error;
       }
-      // Throw a generic one for other unexpected errors during validation
       throw new UnauthorizedException('Authentication failed.');
     }
+  }
+
+  private async getAuthenticationFromSelfHostedKey(
+    request: Request,
+  ): Promise<TokenValidationResult> {
+    const authorization = request.headers.authorization;
+    const headerApiKey = request.headers['x-post-for-me-api-key'];
+    const rawHeaderApiKey = Array.isArray(headerApiKey)
+      ? headerApiKey[0]
+      : headerApiKey;
+
+    const bearerKey =
+      typeof authorization === 'string' && authorization.startsWith('Bearer ')
+        ? authorization.slice('Bearer '.length).trim()
+        : undefined;
+    const apiKey = bearerKey || rawHeaderApiKey?.trim();
+
+    if (!apiKey) {
+      return { isAuthenticated: false };
+    }
+
+    const keyHash = createHash('sha256').update(apiKey).digest('hex');
+    const { data, error } = await (this.supabaseService.supabaseServiceRole as any)
+      .from('self_hosted_api_keys')
+      .select('id, project_id, team_id, created_by, enabled, expires_at')
+      .eq('key_hash', keyHash)
+      .eq('enabled', true)
+      .maybeSingle();
+
+    if (error || !data) {
+      return { isAuthenticated: false };
+    }
+
+    if (data.expires_at && new Date(data.expires_at).getTime() <= Date.now()) {
+      return { isAuthenticated: false };
+    }
+
+    return {
+      isAuthenticated: true,
+      userId: data.created_by,
+      projectId: data.project_id,
+      keyId: data.id,
+      teamId: data.team_id,
+      planType: 'self_hosted',
+    };
   }
 
   private getAuthenticationFromPrincipal(
