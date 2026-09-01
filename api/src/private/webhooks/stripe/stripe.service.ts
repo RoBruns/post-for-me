@@ -3,7 +3,6 @@ import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 
 import { KyselyService } from '../../../kysely/kysely.service';
-
 import { StripeSyncService } from './stripe-sync.service';
 
 @Injectable()
@@ -17,26 +16,25 @@ export class StripeWebhookService {
     private readonly kysely: KyselyService,
     private readonly syncService: StripeSyncService,
   ) {
+    const selfHosted =
+      this.configService.get<string>('SELF_HOSTED') === 'true';
     const secretKey = this.configService.get<string>('STRIPE_SECRET_KEY');
     const webhookSecret = this.configService.get<string>(
       'STRIPE_WEBHOOK_SECRET',
     );
 
-    if (!secretKey) {
+    if (!selfHosted && !secretKey) {
       throw new Error('STRIPE_SECRET_KEY is not defined');
     }
-    if (!webhookSecret) {
+    if (!selfHosted && !webhookSecret) {
       throw new Error('STRIPE_WEBHOOK_SECRET is not defined');
     }
 
-    // Pin the API version explicitly so SDK upgrades don't silently shift
-    // response shapes. This matches what stripe@18.x is built against —
-    // bump in lockstep when upgrading the SDK and re-running tests.
-    this.stripe = new Stripe(secretKey, {
+    this.stripe = new Stripe(secretKey || 'sk_self_hosted_disabled', {
       typescript: true,
       apiVersion: '2025-08-27.basil',
     });
-    this.webhookSecret = webhookSecret;
+    this.webhookSecret = webhookSecret || 'self_hosted_disabled';
   }
 
   constructEvent(rawBody: Buffer, signature: string): Stripe.Event {
@@ -48,9 +46,6 @@ export class StripeWebhookService {
   }
 
   async handleEvent(event: Stripe.Event): Promise<void> {
-    // The mirror is current-state, not an event log — we don't persist
-    // the envelope. Upserts in applyEvent are idempotent on replay; if
-    // the mirror drifts, recover with `bun run stripe:sync`.
     try {
       await this.syncService.applyEvent(this.kysely.db, event);
     } catch (err) {
