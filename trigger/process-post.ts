@@ -1,4 +1,4 @@
-import { logger, task, tasks, tags, wait } from "@trigger.dev/sdk";
+import { logger, task, tasks, tags } from "@trigger.dev/sdk";
 import { createClient } from "@supabase/supabase-js";
 import type {
   IndividualPostData,
@@ -8,139 +8,14 @@ import type {
   PostResult,
   UserTag,
 } from "./posting/post.types";
-import { Unkey } from "@unkey/api";
-
-import { Database, Json } from "./supabase.types";
+import { Database } from "./supabase.types";
 
 const supabaseClient = createClient<Database>(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!,
 );
 
-const transformPostData = (data: {
-  caption: string;
-  created_at: string;
-  external_id: string | null;
-  id: string;
-  post_at: string;
-  project_id: string;
-  status: Database["public"]["Enums"]["social_post_status"];
-  updated_at: string;
-  social_post_provider_connections: {
-    social_provider_connections: {
-      provider: string;
-      id: string;
-      social_provider_user_name: string | null | undefined;
-      social_provider_user_id: string;
-      access_token: string | null | undefined;
-      refresh_token: string | null | undefined;
-      access_token_expires_at: string | null | undefined;
-      refresh_token_expires_at: string | null | undefined;
-      external_id: string | null | undefined;
-    };
-  }[];
-  social_post_media: {
-    url: string;
-    thumbnail_url: string | null;
-    thumbnail_timestamp_ms: number | null;
-    provider: string | null;
-    provider_connection_id: string | null;
-    tags?: Json;
-  }[];
-  social_post_configurations: {
-    caption: string | null;
-    provider: string | null;
-    provider_connection_id: string | null;
-    provider_data: any;
-  }[];
-}) => {
-  const postMedia = data.social_post_media
-    .filter((media) => !media.provider && !media.provider_connection_id)
-    .map((media) => ({
-      url: media.url,
-      thumbnail_url: media.thumbnail_url,
-      thumbnail_timestamp_ms: media.thumbnail_timestamp_ms,
-      tags: media.tags as any[],
-    }));
-
-  const accountConfigurations = data.social_post_configurations
-    .filter((config) => config.provider_connection_id)
-    .map((config) => {
-      const configData: PlatformConfiguration =
-        config.provider_data as PlatformConfiguration;
-
-      return {
-        social_account_id: config.provider_connection_id!, //Social account id is always defined
-        configuration: {
-          caption: config.caption,
-          media: data.social_post_media
-            .filter((media) => media.provider_connection_id)
-            .map((media) => ({
-              url: media.url,
-              thumbnail_url: media.thumbnail_url,
-              thumbnail_timestamp_ms: media.thumbnail_timestamp_ms,
-              tags: media.tags as any[],
-            })),
-          ...configData,
-        },
-      };
-    });
-
-  const platformConfigurations: any = {};
-
-  data.social_post_configurations
-    .filter((config) => config.provider)
-    .map((config) => {
-      platformConfigurations[config.provider!] = {
-        caption: config.caption,
-        media: data.social_post_media
-          .filter((media) => media.provider_connection_id)
-          .map((media) => ({
-            url: media.url,
-            thumbnail_url: media.thumbnail_url,
-            thumbnail_timestamp_ms: media.thumbnail_timestamp_ms,
-            tags: media.tags as any[],
-          })),
-        ...(config.provider_data as PlatformConfiguration),
-      };
-    });
-
-  const socialAccounts = data.social_post_provider_connections.map(
-    (connection) => ({
-      id: connection.social_provider_connections.id,
-      platform: connection.social_provider_connections.provider!,
-      username:
-        connection.social_provider_connections.social_provider_user_name,
-      user_id: connection.social_provider_connections.social_provider_user_id,
-      access_token: connection.social_provider_connections.access_token || "",
-      refresh_token: connection.social_provider_connections.refresh_token,
-      access_token_expires_at:
-        connection.social_provider_connections.access_token_expires_at ||
-        new Date().toISOString(),
-      refresh_token_expires_at:
-        connection.social_provider_connections.refresh_token_expires_at,
-      external_id: connection.social_provider_connections.external_id,
-    }),
-  );
-
-  return {
-    id: data.id,
-    external_id: data.external_id,
-    caption: data.caption,
-    status: data.status,
-    media: postMedia,
-    platform_configurations: platformConfigurations,
-    account_configurations: accountConfigurations,
-    social_accounts: socialAccounts,
-    scheduled_at: data.post_at,
-    created_at: data.created_at,
-    updated_at: data.updated_at,
-  };
-};
-
-const unkey = new Unkey({ rootKey: process.env.UNKEY_ROOT_KEY! });
-
-const UNKEY_MAX_RETRIES = 3;
+const SELF_HOSTED = process.env.SELF_HOSTED === "true";
 
 export const processPost = task({
   id: "process-post",
@@ -148,99 +23,66 @@ export const processPost = task({
   retry: { maxAttempts: 1 },
   run: async (payload: { index: number; post: Post }) => {
     const { post } = payload;
-    logger.info("Starting post processing", { post });
+    logger.info("Starting post processing", {
+      post_id: post.id,
+      project_id: post.project_id,
+      self_hosted: SELF_HOSTED,
+    });
 
     await tags.add([`${post.id}`, `${post.project_id}`]);
 
-    logger.info("Getting post accounts");
     const accounts = post.social_post_provider_connections?.map(
-      ({ social_provider_connections: connection }) => ({
-        ...connection,
-      }),
+      ({ social_provider_connections: connection }) => ({ ...connection }),
     );
 
     const errorResults: PostResult[] = [];
 
     try {
       if (!accounts || accounts.length === 0) {
-        logger.error("No accounts found for post", { post });
+        logger.error("No accounts found for post", { post_id: post.id });
         return [];
       }
 
-      logger.info("Checking API Key is valid");
-      let apiKeyEnabled = false;
-
-      for (let retryCount = 0; retryCount <= UNKEY_MAX_RETRIES; retryCount++) {
-        try {
-          const { data } = await unkey.keys.getKey({ keyId: post.api_key });
-
-          apiKeyEnabled = data.enabled;
-          logger.info("Found API Key", { data });
-          break;
-        } catch (error) {
-          apiKeyEnabled = false;
-          const hasRetriesLeft = retryCount < UNKEY_MAX_RETRIES;
-          const delaySeconds = 2 ** retryCount;
-
-          logger.warn("Unkey API key validation failed, retrying", {
-            retryAttempt: retryCount + 1,
-            maxRetries: UNKEY_MAX_RETRIES,
-            delaySeconds,
-            error,
-          });
-
-          if (hasRetriesLeft) {
-            await wait.for({ seconds: delaySeconds });
-          }
-        }
+      // Authentication already happened at the API boundary. In self-hosted mode
+      // the API key is stored/verified in Supabase, so the worker must not call
+      // the hosted Unkey service again.
+      if (SELF_HOSTED) {
+        logger.info("Skipping hosted API-key revalidation in self-hosted mode");
       }
 
-      if (!apiKeyEnabled) {
-        logger.error("API Key is invalid");
-        errorResults.push(
-          ...accounts.map((connection) => ({
-            success: false,
-            provider_connection_id: connection.id,
-            post_id: post.id,
-            error_message: `API Key is invalid`,
-          })),
-        );
-        throw new Error("API Key is invalid");
-      }
-
-      logger.info("Getting Stripe Customer Id");
       const { data: project, error: projectError } = await supabaseClient
         .from("projects")
         .select(
           `
-        *, 
-        teams(
-         stripe_customer_id
-        ),
-        social_provider_app_credentials( 
-         provider,
-         app_id,
-         app_secret
-        )
-        `,
+          *,
+          teams(
+            stripe_customer_id
+          ),
+          social_provider_app_credentials(
+            provider,
+            app_id,
+            app_secret
+          )
+          `,
         )
         .eq("id", post.project_id)
         .single();
 
-      if (projectError || !project?.teams?.stripe_customer_id) {
+      if (projectError || !project) {
         logger.error("Project not found", { projectError, project });
         errorResults.push(
           ...accounts.map((connection) => ({
             success: false,
             provider_connection_id: connection.id,
             post_id: post.id,
-            error_message: `No project found`,
+            error_message: "No project found",
           })),
         );
         throw new Error("No project found");
       }
 
       await tags.add(`${project.team_id}`);
+
       const postMedia: {
         id: string;
         provider?: string | null;
@@ -252,8 +94,9 @@ export const processPost = task({
         tags?: UserTag[] | null;
         skip_processing?: boolean | null;
       }[] = [];
+
       if (post.social_post_media && post.social_post_media.length > 0) {
-        logger.info("Localizing Media", { media: post.social_post_media });
+        logger.info("Localizing media", { media_count: post.social_post_media.length });
 
         const localizedMedia = await tasks.batchTriggerAndWait(
           "process-post-medium",
@@ -273,178 +116,149 @@ export const processPost = task({
           })),
         );
 
-        logger.info("Localizing Media Complete", { localizedMedia });
-
-        const succesfulMedia = localizedMedia.runs
+        const successfulMedia = localizedMedia.runs
           .filter((run) => run.ok)
           .map((run) => run.output);
 
-        const postImages = succesfulMedia.filter(
+        const postImages = successfulMedia.filter(
           (medium) => medium.type !== "video",
         );
-        const postVideos = succesfulMedia.filter(
+        const postVideos = successfulMedia.filter(
           (medium) => medium.type === "video",
         );
 
         postMedia.push(...postImages);
-        postMedia.push(...postVideos.filter((m) => m.skip_processing));
+        postMedia.push(...postVideos.filter((medium) => medium.skip_processing));
 
-        const videosToProcess = postVideos.filter((m) => !m.skip_processing);
+        const videosToProcess = postVideos.filter(
+          (medium) => !medium.skip_processing,
+        );
 
         if (videosToProcess.length > 0) {
-          logger.info("Processing Videos");
           const processVideosResult = await tasks.batchTriggerAndWait(
             "ffmpeg-process-video",
-            videosToProcess.map((video) => ({
-              payload: {
-                medium: video,
-              },
-            })),
+            videosToProcess.map((video) => ({ payload: { medium: video } })),
           );
-
-          logger.info("Processing Videos Complete", { processVideosResult });
 
           postMedia.push(
             ...processVideosResult.runs
               .filter((run) => run.ok)
               .map((run) => run.output),
           );
-
-          logger.info("Updated post media with processed video URLs", {
-            postMedia,
-          });
         }
 
-        if (postMedia.length == 0) {
-          logger.error("All Media Failed");
+        if (postMedia.length === 0) {
           errorResults.push(
             ...accounts.map((connection) => ({
               success: false,
               provider_connection_id: connection.id,
               post_id: post.id,
-              error_message: `All media failed to process, please check media URLS`,
+              error_message:
+                "All media failed to process, please check media URLs",
             })),
           );
           throw new Error("All media failed to process");
         }
       }
 
-      logger.info("Constructing Post Data");
+      const teams = project.teams as unknown as
+        | { stripe_customer_id?: string | null }
+        | null;
+      const billingCustomerId = teams?.stripe_customer_id || project.team_id;
 
       const postData = {
         id: post.id,
-        stripe_customer_id: project.teams.stripe_customer_id,
+        billing_customer_id: billingCustomerId,
         caption: post.caption,
         configurations: post.social_post_configurations,
         media: postMedia,
-        api_key: post.api_key,
-        accounts: accounts,
+        accounts,
       };
-
-      logger.info("Constructed Post Data", { postData });
 
       const bulkPostData: IndividualPostData[] = [];
       const storyBulkPostData: IndividualPostData[] = [];
+
       for (const account of postData.accounts) {
         try {
-          logger.info("Getting App Credentials");
-
           let appCredentials: PlatformAppCredentials | null = null;
+
           switch (account.provider) {
             case "bluesky":
               appCredentials = {
                 app_id: "blue_sky_app_id",
                 app_secret: "blue_sky_app_secret",
-              } as PlatformAppCredentials;
+              };
               break;
             case "instagram":
               switch (account.social_provider_metadata?.connection_type) {
                 case "instagram":
                   appCredentials = project.social_provider_app_credentials.find(
                     (credential) => credential.provider === "instagram",
-                  ) as PlatformAppCredentials;
+                  ) as PlatformAppCredentials | undefined || null;
                   break;
                 case "facebook":
                   appCredentials = project.social_provider_app_credentials.find(
                     (credential) =>
                       credential.provider === "instagram_w_facebook",
-                  ) as PlatformAppCredentials;
+                  ) as PlatformAppCredentials | undefined || null;
                   break;
                 default:
                   appCredentials = project.social_provider_app_credentials.find(
                     (credential) =>
                       credential.provider === account.provider ||
                       credential.provider === "instagram_w_facebook",
-                  ) as PlatformAppCredentials;
+                  ) as PlatformAppCredentials | undefined || null;
                   break;
               }
-
               break;
             case "x":
               appCredentials = project.social_provider_app_credentials.find(
                 (credential) =>
                   credential.provider ===
-                  (account.social_provider_metadata?.connection_type ===
-                  "oauth2"
+                  (account.social_provider_metadata?.connection_type === "oauth2"
                     ? "x_oauth2"
                     : "x"),
-              ) as PlatformAppCredentials;
+              ) as PlatformAppCredentials | undefined || null;
               break;
             default:
               appCredentials = project.social_provider_app_credentials.find(
                 (credential) => credential.provider === account.provider,
-              ) as PlatformAppCredentials;
+              ) as PlatformAppCredentials | undefined || null;
               break;
           }
 
           if (!appCredentials) {
-            logger.error("No App credentials found for provider", {
-              provider: account.provider,
-            });
             errorResults.push({
               success: false,
               provider_connection_id: account.id,
               post_id: post.id,
-              error_message: `No App credentials found for provider ${account.provider}`,
+              error_message: `No app credentials found for provider ${account.provider}`,
             });
             continue;
           }
 
-          logger.info("Got App Credentials");
-
-          logger.info("Creating Individual Post Configuration");
           const platformConfig = postData.configurations.filter(
-            (config) => config.provider == account.provider,
+            (config) => config.provider === account.provider,
           )?.[0];
           const accountConfig = postData.configurations.filter(
-            (config) => config.provider_connection_id == account.id,
+            (config) => config.provider_connection_id === account.id,
           )?.[0];
           const platformMedia = postData.media.filter(
-            (medium) => medium.provider == account.provider,
+            (medium) => medium.provider === account.provider,
           );
           const accountMedia = postData.media.filter(
-            (medium) => medium.provider_connection_id == account.id,
+            (medium) => medium.provider_connection_id === account.id,
           );
           const defaultMedia = postData.media.filter(
             (medium) => !medium.provider && !medium.provider_connection_id,
           );
 
-          logger.info("Procesing Configuration Data", {
-            platformConfig,
-            accountConfig,
-            platformMedia,
-            accountMedia,
-            defaultMedia,
-          });
-
           const caption =
-            accountConfig?.caption ||
-            platformConfig?.caption ||
-            postData.caption;
+            accountConfig?.caption || platformConfig?.caption || postData.caption;
           const media =
-            accountMedia && accountMedia.length > 0
+            accountMedia.length > 0
               ? accountMedia
-              : platformConfig && platformMedia.length > 0
+              : platformMedia.length > 0
                 ? platformMedia
                 : defaultMedia;
 
@@ -453,50 +267,33 @@ export const processPost = task({
             ...accountConfig?.provider_data,
           } as PlatformConfiguration;
 
-          const isStoryPlacement =
-            (platformData as { placement?: string }).placement === "stories";
+          const individualPostData: IndividualPostData = {
+            stripeCustomerId: postData.billing_customer_id,
+            teamId: project.team_id,
+            platform: account.provider,
+            postId: postData.id,
+            account,
+            media,
+            caption,
+            platformConfig: platformData,
+            appCredentials,
+            projectId: post.project_id,
+          };
 
-          if (isStoryPlacement) {
+          if (
+            (platformData as { placement?: string }).placement === "stories"
+          ) {
             for (const medium of media) {
-              storyBulkPostData.push({
-                stripeCustomerId: postData.stripe_customer_id,
-                teamId: project.team_id,
-                platform: account.provider,
-                postId: postData.id,
-                account,
-                media: [medium],
-                caption,
-                platformConfig: platformData,
-                appCredentials,
-                projectId: post.project_id,
-              });
+              storyBulkPostData.push({ ...individualPostData, media: [medium] });
             }
           } else {
-            bulkPostData.push({
-              stripeCustomerId: postData.stripe_customer_id,
-              teamId: project.team_id,
-              platform: account.provider,
-              postId: postData.id,
-              account,
-              media,
-              caption,
-              platformConfig: platformData,
-              appCredentials,
-              projectId: post.project_id,
-            });
+            bulkPostData.push(individualPostData);
           }
-
-          logger.info("Created Indidividual Post Configuration");
         } catch (error: any) {
-          logger.error("Failed Posting To Account", {
-            account,
-            postData,
-            error,
-          });
-
+          logger.error("Failed constructing platform post", { error });
           errorResults.push({
             success: false,
-            error_message: error?.message || "Unkown error",
+            error_message: error?.message || "Unknown error",
             provider_connection_id: account.id,
             post_id: postData.id,
             details: { error },
@@ -505,47 +302,19 @@ export const processPost = task({
       }
 
       if (bulkPostData.length > 0) {
-        logger.info("Posting To Accounts", { bulkPostData });
-        const batchPostResult = await tasks.batchTriggerAndWait(
+        await tasks.batchTriggerAndWait(
           "post-to-platform",
           bulkPostData.map((data) => ({ payload: data })),
         );
-
-        logger.info("Posting To Accounts Complete", { batchPostResult });
       }
 
-      if (storyBulkPostData.length > 0) {
-        logger.info("Posting Story Media Sequentially", {
-          totalStoryPosts: storyBulkPostData.length,
-        });
-
-        for (const [index, storyPostData] of storyBulkPostData.entries()) {
-          logger.info("Posting Story Media", {
-            current: index + 1,
-            total: storyBulkPostData.length,
-            provider: storyPostData.platform,
-            provider_connection_id: storyPostData.account.id,
-          });
-
-          const storyPostResult = await tasks.triggerAndWait(
-            "post-to-platform",
-            storyPostData,
-          );
-
-          logger.info("Posting Story Media Complete", {
-            current: index + 1,
-            total: storyBulkPostData.length,
-            provider: storyPostData.platform,
-            provider_connection_id: storyPostData.account.id,
-            success: storyPostResult.ok,
-          });
-        }
+      for (const storyPostData of storyBulkPostData) {
+        await tasks.triggerAndWait("post-to-platform", storyPostData);
       }
     } catch (error) {
-      logger.error("Unexpected Error", { error });
+      logger.error("Unexpected error while processing post", { error });
     } finally {
-      if (errorResults && errorResults.length > 0) {
-        logger.info("Saving Post Results", { errorResults });
+      if (errorResults.length > 0) {
         const { data: insertedPostResults, error: insertResultsError } =
           await supabaseClient
             .from("social_post_results")
@@ -554,71 +323,45 @@ export const processPost = task({
 
         if (insertResultsError) {
           logger.error("Failed to insert post results", { insertResultsError });
-        } else {
-          const webhookEvents = insertedPostResults.map((r) => ({
-            payload: {
-              projectId: post.project_id,
-              eventType: "social.post.result.created",
-              eventData: {
-                details: r.details,
-                id: r.id,
-                error: r.error_message,
-                platform_data: {
-                  id: r.provider_post_id,
-                  url: r.provider_post_url,
+        } else if (insertedPostResults) {
+          await tasks.batchTrigger(
+            "process-webhooks",
+            insertedPostResults.map((result) => ({
+              payload: {
+                projectId: post.project_id,
+                eventType: "social.post.result.created",
+                eventData: {
+                  details: result.details,
+                  id: result.id,
+                  error: result.error_message,
+                  platform_data: {
+                    id: result.provider_post_id,
+                    url: result.provider_post_url,
+                  },
+                  post_id: result.post_id,
+                  social_account_id: result.provider_connection_id,
+                  success: result.success,
                 },
-                post_id: r.post_id,
-                social_account_id: r.provider_connection_id,
-                success: r.success,
               },
-            },
-          }));
-          await tasks.batchTrigger("process-webhooks", webhookEvents);
+            })),
+          );
         }
       }
 
-      logger.info("Updating Post Status");
       const { data: updatedPost, error: updatePostError } = await supabaseClient
         .from("social_posts")
-        .update({
-          status: "processed",
-        })
+        .update({ status: "processed" })
         .eq("id", post.id)
-        .select(
-          `
-        *,
-        social_post_provider_connections (
-          social_provider_connections (
-            *
-          )
-        ),
-        social_post_media (
-          url,
-          thumbnail_url,
-          thumbnail_timestamp_ms,
-          provider,
-          provider_connection_id,
-          tags
-        ),
-        social_post_configurations (
-         caption,
-         provider,
-         provider_connection_id,
-         provider_data
-        )
-        `,
-        )
+        .select("*")
         .single();
 
       if (updatePostError) {
         logger.error("Failed to update post status", { updatePostError });
-      }
-
-      if (updatedPost) {
+      } else if (updatedPost) {
         await tasks.trigger("process-webhooks", {
           projectId: post.project_id,
           eventType: "social.post.updated",
-          eventData: transformPostData(updatedPost),
+          eventData: updatedPost,
         });
       }
     }
