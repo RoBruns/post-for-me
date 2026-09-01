@@ -1,8 +1,11 @@
-FROM node:24-alpine
+FROM node:24-bookworm-slim
 
 WORKDIR /app
 
-RUN npm init -y \
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && npm init -y \
   && npm install --omit=dev post-for-me-mcp@2.9.1 deno@2.9.6
 
 ENV PATH="/app/node_modules/.bin:${PATH}"
