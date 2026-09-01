@@ -15,4 +15,4 @@ ENV MCP_SERVER_DOCS_SEARCH_MODE=local
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "node node_modules/post-for-me-mcp/dist/index.js --transport=http --port=${PORT:-8080} --code-execution-mode=local --docs-search-mode=local"]
+CMD ["sh", "-c", "./node_modules/.bin/mcp-server --transport=http --port=${PORT:-8080} --code-execution-mode=local --docs-search-mode=local"]
