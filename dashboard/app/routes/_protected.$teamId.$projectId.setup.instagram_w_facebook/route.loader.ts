@@ -2,22 +2,14 @@ import { data } from "react-router";
 
 import { withSupabase } from "~/lib/.server/supabase";
 
-export const loader = withSupabase(async ({ supabase, params }) => {
+export const loader = withSupabase(async ({ supabase, params, request }) => {
   const { teamId, projectId } = params;
 
-  if (!teamId) {
-    throw new Error("Team code is required");
-  }
-
-  if (!projectId) {
-    throw new Error("Project ID is required");
-  }
+  if (!teamId) throw new Error("Team code is required");
+  if (!projectId) throw new Error("Project ID is required");
 
   const currentUser = await supabase.auth.getUser();
-
-  if (!currentUser.data?.user) {
-    throw new Error("User not found");
-  }
+  if (!currentUser.data?.user) throw new Error("User not found");
 
   const [project, credential] = await Promise.all([
     supabase
@@ -37,7 +29,6 @@ export const loader = withSupabase(async ({ supabase, params }) => {
     throw new Response("Project not found", { status: 404 });
   }
 
-  // If there's an error other than no rows found, throw it
   if (credential.error) {
     throw new Response("Failed to fetch credentials", { status: 500 });
   }
@@ -46,12 +37,15 @@ export const loader = withSupabase(async ({ supabase, params }) => {
     appId: credential?.data?.app_id || "",
     appSecret: credential?.data?.app_secret || "",
   };
+  const dashboardAppUrl = (
+    process.env.DASHBOARD_APP_URL || new URL(request.url).origin
+  ).replace(/\/$/, "");
 
   return data({
     provider: "instagram_w_facebook",
     credential: providerCredential,
     authCallbackUrl: project.data?.auth_callback_url || "",
     setupGuideUrl: `https://www.postforme.dev/resources/getting-started-with-the-instagram-api`,
-    redirectUrl: `https://app.postforme.dev/callback/${projectId}/instagram/account`,
+    redirectUrl: `${dashboardAppUrl}/callback/${projectId}/instagram/account`,
   });
 });
