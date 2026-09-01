@@ -1,0 +1,25 @@
+name: Trigger Self-Host Check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "trigger/**"
+      - ".github/workflows/trigger-selfhost-check.yml"
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: trigger
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: trigger/.bun-version
+      - run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
