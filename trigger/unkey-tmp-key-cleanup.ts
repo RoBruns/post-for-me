@@ -1,61 +1,38 @@
 import { logger, schedules } from "@trigger.dev/sdk";
-import { Unkey } from "@unkey/api";
+import { createClient } from "@supabase/supabase-js";
 
-const unkey = new Unkey({ rootKey: process.env.UNKEY_ROOT_KEY! });
-
-const UNKEY_API_ID = process.env.UNKEY_API_ID!;
-
-const TMP_KEY_PREFIX = process.env.TMP_KEY_PREFIX || "pfm_tmp";
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+);
 
 export const unkeyTmpKeyCleanup = schedules.task({
   cron: { pattern: "0 */1 * * *", environments: ["PRODUCTION"] },
-  id: "unkey-tmp-key-cleanup",
-  maxDuration: 3600,
+  id: "self-hosted-tmp-key-cleanup",
+  maxDuration: 300,
   retry: { maxAttempts: 1 },
   machine: "small-1x",
-  run: async (payload) => {
-    logger.info("Starting Unkey TMP Key Cleanup", { payload });
-    const keysToDelete: string[] = [];
-
-    logger.info("Fetching keys from Unkey");
-    let cursor: string | undefined = undefined;
-    let hasMore = true;
-    do {
-      const apiKeys = await unkey.apis.listKeys({
-        apiId: UNKEY_API_ID,
-        limit: 100,
-        cursor,
-        revalidateKeysCache: true,
-      });
-
-      if (apiKeys.data) {
-        for (const key of apiKeys.data) {
-          if (
-            key.start.includes(TMP_KEY_PREFIX) &&
-            key.expires &&
-            key.expires < Date.now()
-          ) {
-            keysToDelete.push(key.keyId);
-          }
-        }
-
-        cursor = apiKeys.pagination?.cursor;
-        hasMore = apiKeys.pagination?.hasMore || false;
-      }
-    } while (hasMore);
-
-    if (keysToDelete.length === 0) {
-      logger.info("No expired TMP keys found");
+  run: async () => {
+    if (process.env.SELF_HOSTED !== "true") {
+      logger.info("Skipping self-hosted temporary key cleanup");
       return;
     }
 
-    logger.info("Expired TMP Keys", { keysToDelete });
-    for (const key of keysToDelete) {
-      logger.info("Deleting key", { key });
-      const result = await unkey.keys.deleteKey({ keyId: key });
-      logger.info("Deleted key", { key, result });
+    const { data, error } = await supabase
+      .from("self_hosted_api_keys")
+      .delete()
+      .like("key_prefix", "pfm_tmp%")
+      .not("expires_at", "is", null)
+      .lt("expires_at", new Date().toISOString())
+      .select("id");
+
+    if (error) {
+      logger.error("Failed to clean up expired temporary API keys", { error });
+      throw new Error(error.message);
     }
 
-    logger.info("Unkey TMP Key Cleanup completed");
+    logger.info("Expired temporary API keys cleaned up", {
+      deleted: data?.length || 0,
+    });
   },
 });
