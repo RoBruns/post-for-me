@@ -6,7 +6,9 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates \
   && rm -rf /var/lib/apt/lists/* \
   && npm init -y \
-  && npm install --omit=dev post-for-me-mcp@2.9.1 deno@2.9.6
+  && npm install --omit=dev post-for-me-mcp@2.9.1 deno@2.9.6 \
+  && node node_modules/deno/install.cjs \
+  && ./node_modules/.bin/deno --version
 
 ENV PATH="/app/node_modules/.bin:${PATH}"
 ENV MCP_SERVER_TRANSPORT=http
