@@ -6,26 +6,15 @@ import type { Database } from "~/lib/.server/database.types";
 
 type SocialProviderEnum = Database["public"]["Enums"]["social_provider"];
 
-export const loader = withSupabase(async ({ supabase, params }) => {
+export const loader = withSupabase(async ({ supabase, params, request }) => {
   const { teamId, projectId, provider } = params;
 
-  if (!teamId) {
-    throw new Error("Team code is required");
-  }
-
-  if (!projectId) {
-    throw new Error("Project ID is required");
-  }
-
-  if (!provider) {
-    throw new Error("Provider is required");
-  }
+  if (!teamId) throw new Error("Team code is required");
+  if (!projectId) throw new Error("Project ID is required");
+  if (!provider) throw new Error("Provider is required");
 
   const currentUser = await supabase.auth.getUser();
-
-  if (!currentUser.data?.user) {
-    throw new Error("User not found");
-  }
+  if (!currentUser.data?.user) throw new Error("User not found");
 
   const [project, credential] = await Promise.all([
     supabase
@@ -45,7 +34,6 @@ export const loader = withSupabase(async ({ supabase, params }) => {
     throw new Response("Project not found", { status: 404 });
   }
 
-  // If there's an error other than no rows found, throw it
   if (credential.error) {
     throw new Response("Failed to fetch credentials", { status: 500 });
   }
@@ -55,18 +43,18 @@ export const loader = withSupabase(async ({ supabase, params }) => {
     appSecret: credential?.data?.app_secret || "",
   };
 
-
   const callbackProvider = provider === "x_oauth2" ? "x" : provider;
-
   const setupGuideProvider =
     provider === "x" || provider === "x_oauth2" ? "x-twitter" : provider;
-
+  const dashboardAppUrl = (
+    process.env.DASHBOARD_APP_URL || new URL(request.url).origin
+  ).replace(/\/$/, "");
 
   return data({
     provider,
     credential: providerCredential,
     authCallbackUrl: project.data?.auth_callback_url || "",
-    redirectUrl: `https://app.postforme.dev/callback/${projectId}/${callbackProvider}/account`,
+    redirectUrl: `${dashboardAppUrl}/callback/${projectId}/${callbackProvider}/account`,
     setupGuideUrl: `https://www.postforme.dev/resources/getting-started-with-the-${setupGuideProvider}-api`,
   });
 });
