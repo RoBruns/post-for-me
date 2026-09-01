@@ -10,7 +10,7 @@ RUN apt-get update \
   && node node_modules/deno/install.cjs \
   && ./node_modules/.bin/deno --version
 
-COPY mcp/oauth-proxy.mjs /app/oauth-proxy.mjs
+COPY oauth-proxy.mjs /app/oauth-proxy.mjs
 
 ENV PATH="/app/node_modules/.bin:${PATH}"
 ENV MCP_SERVER_TRANSPORT=http
